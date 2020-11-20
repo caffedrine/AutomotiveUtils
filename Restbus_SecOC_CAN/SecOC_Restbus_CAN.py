@@ -1,11 +1,15 @@
+#
 # Restbus simulation capable to read and send back SecOC packets ith counter.
-# !/usr/bin/python3
+#
 
+# !/usr/bin/python3
 import os
 import sys
 import datetime
 import time
 from threading import Thread
+from Crypto.Hash import CMAC
+from Crypto.Cipher import AES
 
 
 def Log(str_text, end='\n'):
@@ -15,9 +19,43 @@ def Log(str_text, end='\n'):
     sys.stdout.flush()
 
 
+class CanIf:
+    def __init__(self, interface_name):
+        self._interface_name = interface_name
+        # Atomic variables to make sure Send/Read is triggered synchronous from multiple threads
+        self._send_ongoing = False
+        self._read_ongoing = False
+
+    def SendMsg(self, msg_id, msg_data, extended_id=False):
+        # Wait in case other tasks are sending
+        while self._send_ongoing:
+            time.sleep(0.001)
+
+        self._send_ongoing = True
+
+        Log("CAN Send: %.2X#%s" % (msg_id, msg_data))
+
+        self._send_ongoing = False
+
+    def ReadMsg(self, msg_id):
+        # Wait in case other tasks are reading
+        while self._read_ongoing:
+            time.sleep(0.001)
+
+        self._read_ongoing = True
+
+        read_data = "1122334455667788"
+        Log("CAN Recv: %.2X#%s" % (msg_id, read_data))
+
+        self._read_ongoing = False
+        return read_data
+
+
 class SecOC_Restbus:
     def __init__(self, can_channel, key):
-        self._can_channel = can_channel
+        # Get instance of CAN intefrace
+        self._can = CanIf(can_channel)
+
         self._key = str(key).replace(" ", "")
         self._counter_started = False
         self._counter_can_id = 0x00
@@ -26,7 +64,7 @@ class SecOC_Restbus:
         self._shutdown = False
 
         # Start workers
-        self._worker_ctr_main = Thread(target=self.CounterMainFunction, name="Counter broadcast messages", args=[])
+        self._worker_ctr_main = Thread(target=self.__CounterMainFunction, name="Counter broadcast messages", args=[])
         self._worker_ctr_main.daemon = True
         self._worker_ctr_main.start()
 
@@ -42,10 +80,16 @@ class SecOC_Restbus:
         else:
             self._counter += 1
 
+    def __CalculateCMAC(self, input_data):
+        secret = bytes.fromhex(self._key)
+        c = CMAC.new(secret, ciphermod=AES)
+        c.update(input_data)
+        return c.digest()
+
     def __GetMillisSinceEpoch(self):
         return int(time.time_ns() // 1000000)
 
-    def CounterMainFunction(self):
+    def __CounterMainFunction(self):
         last_send_timestamp = 0
         while not self._shutdown:
             if self._counter_started:
@@ -54,7 +98,13 @@ class SecOC_Restbus:
                 if curr_time - last_send_timestamp >= 200:
                     last_send_timestamp = curr_time
                     self.__IncrementCounter()
-                    Log("TickCount: %d" % self._counter)
+                    # Classic 8bytes can frame
+                    counter_can_msg = [0x00] * 8
+                    # Write counter inside message buffer
+                    for i in range(0, 4):
+                        counter_can_msg[i] = (self._counter & (0x000000FF << (i*8))) >> (i*8)
+                    # Send message on the bus
+                    self._can.SendMsg(self._counter_can_id, counter_can_msg)
 
             # Prevent CPU from getting crazy
             time.sleep(0.001)
@@ -81,7 +131,7 @@ def main():
     restbus.StartCounterBroadcast()
 
     Log("Wait 1 s...")
-    time.sleep(1)
+    time.sleep(5)
     Log("Timeout, application will close")
 
 # Execute main function
